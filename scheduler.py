@@ -16,15 +16,17 @@ from db import DB
 from utils import log
 
 
+from datetime import datetime, date, time, timedelta  # <-- asegúrate de tener timedelta importado
+
 def select_candidates(df: pd.DataFrame, db: DB) -> List[Tuple[int, pd.Series]]:
     """
-    Aplica reglas de prioridad:
-    1) Solo filas válidas (YouTube + fecha).
+    Reglas:
+    1) Filas válidas (YouTube + fecha).
     2) Excluye URLs posteadas en <= NO_REPEAT_DAYS.
     3) Prioriza recientes (ReleaseDate dentro de RECENT_DAYS).
+    Comparación usando fechas (date) sin zona horaria para evitar TypeError.
     """
-    now = pd.Timestamp.now(tz=settings.TZ)
-    # Filtrado básico
+    # Filtro básico
     df = df.dropna(subset=["ReleaseDate"]).copy()
     df = df[df["YouTubeURL"].str.len() > 0]
 
@@ -37,15 +39,20 @@ def select_candidates(df: pd.DataFrame, db: DB) -> List[Tuple[int, pd.Series]]:
     if df.empty:
         return []
 
-    # Prioridad por reciente
-    recent_cut = now - pd.Timedelta(days=settings.RECENT_DAYS)
-    df_recent = df[df["ReleaseDate"] >= recent_cut]
-    df_back = df[df["ReleaseDate"] < recent_cut]
+    # Normalizamos a 'date' (sin tz) para comparar
+    df["ReleaseDateDate"] = df["ReleaseDate"].dt.date
+    today = datetime.now().date()
+    recent_cut = today - timedelta(days=settings.RECENT_DAYS)
+
+    # Partición por recientes vs back-catalog
+    df_recent = df[df["ReleaseDateDate"] >= recent_cut]
+    df_back = df[df["ReleaseDateDate"] < recent_cut]
 
     ordered: List[Tuple[int, pd.Series]] = []
     ordered.extend(list(df_recent.iterrows()))
     ordered.extend(list(df_back.iterrows()))
     return ordered
+
 
 
 class BotScheduler:
