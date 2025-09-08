@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # Excel / Paths
     # ---------------------------
     EXCEL_PATH: str = Field(default="./data/tracks.xlsx")
-
+    EXCEL_SHEET: str = Field(default="Tracks")
     # ---------------------------
     # Miniatura opcional YouTube
     # ---------------------------
