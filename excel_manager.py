@@ -18,7 +18,7 @@ REQUIRED_COLUMNS = [
 class ExcelManager:
     def __init__(self, path: str | Path | None = None, sheet: str | None = None):
         self.path = Path(path or settings.EXCEL_PATH)
-        self.sheet = sheet or settings.EXCEL_SHEET
+        self.sheet = sheet or getattr(settings, "EXCEL_SHEET", "Tracks")
         self.df: Optional[pd.DataFrame] = None
 
     def load(self) -> pd.DataFrame:
