@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict
 
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -134,7 +134,13 @@ class BotScheduler:
             media_ids = x.prepare_thumbnail_if_enabled(cand.url, cand.platform)
             resp = x.post_text(text, media_ids=media_ids)
 
-            logger.info({"event": "post_done", "platform": cand.platform, "url": cand.url, "dry_run": settings.DRY_RUN, "resp": resp})
+            logger.info({
+                "event": "post_done",
+                "platform": cand.platform,
+                "url": cand.url,
+                "dry_run": settings.DRY_RUN,
+                "resp": resp,
+            })
 
             # Persistencia (si NO es dry-run)
             if not settings.DRY_RUN:
@@ -167,7 +173,14 @@ class BotScheduler:
 
         # Fechas
         if "ReleaseDate" in df.columns:
-            df["ReleaseDate"] = pd.to_datetime(df["ReleaseDate"], errors="coerce")
+            # A tz-aware en la TZ del bot para evitar comparaciones naive/aware
+            rdt = pd.to_datetime(df["ReleaseDate"], errors="coerce")
+            try:
+                rdt = rdt.dt.tz_localize(self.tz)  # si eran naive
+            except TypeError:
+                # si ya vienen con tz, sólo convertimos
+                rdt = rdt.dt.tz_convert(self.tz)
+            df["ReleaseDate"] = rdt
 
         # Flags por plataforma
         for plat, cols in self.platform_cols.items():
@@ -178,7 +191,8 @@ class BotScheduler:
             if cols["last"] not in df.columns:
                 df[cols["last"]] = pd.NaT
             else:
-                df[cols["last"]] = pd.to_datetime(df[cols["last"]], errors="coerce")
+                last = pd.to_datetime(df[cols["last"]], errors="coerce")
+                df[cols["last"]] = last
 
         return df
 
@@ -219,8 +233,22 @@ class BotScheduler:
             title = str(row.get("Title") or "").strip()
             artist = (str(row.get("Artist")) if pd.notna(row.get("Artist")) else None)
             lang = (str(row.get("Language")) if pd.notna(row.get("Language")) else None)
-            rdt = row.get("ReleaseDate")
-            rdt_dt: Optional[datetime] = pd.to_datetime(rdt, errors="coerce").to_pydatetime() if pd.notna(rdt) else None
+
+            rdt_ts = pd.to_datetime(row.get("ReleaseDate"), errors="coerce")
+            if pd.notna(rdt_ts):
+                # Asegura tz-aware en la TZ del bot
+                try:
+                    if rdt_ts.tz is None:
+                        rdt_ts = rdt_ts.tz_localize(self.tz)
+                    else:
+                        rdt_ts = rdt_ts.tz_convert(self.tz)
+                except AttributeError:
+                    # por si fuera datetime nativo
+                    if rdt_ts.tzinfo is None:
+                        rdt_ts = rdt_ts.replace(tzinfo=self.tz)
+                rdt_dt: Optional[datetime] = rdt_ts.to_pydatetime()
+            else:
+                rdt_dt = None
 
             for plat in plats:
                 if plat not in self.platform_cols:
@@ -231,7 +259,10 @@ class BotScheduler:
                     continue
 
                 last_at = row.get(cols["last"])
-                last_dt = pd.to_datetime(last_at, errors="coerce").to_pydatetime() if pd.notna(last_at) else None
+                last_dt = pd.to_datetime(last_at, errors="coerce")
+                last_dt = last_dt.to_pydatetime() if pd.notna(last_dt) else None
+
+                is_recent = (rdt_dt is not None and rdt_dt >= recent_cut)
 
                 cand = Candidate(
                     row_idx=row_idx,
@@ -245,7 +276,7 @@ class BotScheduler:
                     lang=lang,
                     release_dt=rdt_dt,
                     last_posted_at=last_dt,
-                    is_recent=(rdt_dt is not None and rdt_dt >= recent_cut),
+                    is_recent=is_recent,
                 )
 
                 # Filtro de cooldown por URL (no repetir el MISMO URL en <= COOLDOWN días)
@@ -265,7 +296,6 @@ class BotScheduler:
         mask = (df[cols["url"]].astype(str).str.strip() == url.strip())
         if mask.any():
             last_col = cols["last"]
-            # Si existe algún last_posted >= cutoff, bloquea
             recent = pd.to_datetime(df.loc[mask, last_col], errors="coerce")
             if recent.notna().any() and (recent >= cutoff).any():
                 return True
@@ -277,7 +307,7 @@ class BotScheduler:
 
         # Orden: recientes primero, luego por fecha de lanzamiento (desc), y como desempate, índice original
         def sort_key(c: Candidate):
-            # Para None en release_dt, poner muy antiguo
+            # Para None en release_dt, poner muy antiguo (con tz del bot)
             rd = c.release_dt or datetime(1970, 1, 1, tzinfo=self.tz)
             return (0 if c.is_recent else 1, -rd.timestamp(), c.row_idx)
 
@@ -289,8 +319,11 @@ class BotScheduler:
     # ---------------------------
     def _mark_posted(self, df: pd.DataFrame, cand: Candidate, when: datetime) -> None:
         df.loc[cand.row_idx, cand.posted_col] = True
-        df.loc[cand.row_idx, cand.last_posted_col] = when
+        # Excel/openpyxl no soporta tz-aware: guardamos naive (sin tz)
+        when_naive = when.replace(tzinfo=None)
+        df.loc[cand.row_idx, cand.last_posted_col] = when_naive
 
 
 # Sugerencia: si tu main.py necesita una instancia global para endpoints, puedes crearla así:
 # scheduler_instance = BotScheduler()
+
