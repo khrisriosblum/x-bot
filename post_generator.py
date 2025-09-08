@@ -62,3 +62,5 @@ def build_copy(title: str, artist: str | None, lang: str | None, release_dt, pla
         copy = f"{headline}\n{base_info}\n{final_url}"
 
     return copy
+# Compatibilidad con versiones anteriores del scheduler
+build_post = build_copy
