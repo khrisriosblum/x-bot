@@ -1,180 +1,296 @@
+# scheduler.py
 from __future__ import annotations
-from typing import List, Tuple
-from datetime import datetime, date, time
-import random
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
 
 import pandas as pd
-import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from zoneinfo import ZoneInfo
+from openpyxl import load_workbook
 
 from settings import settings
-from excel_manager import ExcelManager
-from post_generator import build_post
+from post_generator import build_post   # alias a build_copy
 from x_client import XClient
-from db import DB
-from utils import log
+
+logger = logging.getLogger("xbot")
 
 
-from datetime import datetime, date, time, timedelta  # <-- asegúrate de tener timedelta importado
-
-def select_candidates(df: pd.DataFrame, db: DB) -> List[Tuple[int, pd.Series]]:
+# ---------------------------
+# Helpers horario
+# ---------------------------
+def _parse_slot_to_hm(slot: str) -> tuple[int, int]:
     """
-    Reglas:
-    1) Filas válidas (YouTube + fecha).
-    2) Excluye URLs posteadas en <= NO_REPEAT_DAYS.
-    3) Prioriza recientes (ReleaseDate dentro de RECENT_DAYS).
-    Comparación usando fechas (date) sin zona horaria para evitar TypeError.
+    Acepta 'HH' o 'HH:MM' y devuelve (hora, minuto).
+    Lanza ValueError si es inválido.
     """
-    # Filtro básico
-    df = df.dropna(subset=["ReleaseDate"]).copy()
-    df = df[df["YouTubeURL"].str.len() > 0]
-
-    # Anti-duplicados por historial
-    urls = df["YouTubeURL"].tolist()
-    blocked = db.posted_in_last_days(urls, settings.NO_REPEAT_DAYS)
-    if blocked:
-        df = df[~df["YouTubeURL"].isin(blocked)]
-
-    if df.empty:
-        return []
-
-    # Normalizamos a 'date' (sin tz) para comparar
-    df["ReleaseDateDate"] = df["ReleaseDate"].dt.date
-    today = datetime.now().date()
-    recent_cut = today - timedelta(days=settings.RECENT_DAYS)
-
-    # Partición por recientes vs back-catalog
-    df_recent = df[df["ReleaseDateDate"] >= recent_cut]
-    df_back = df[df["ReleaseDateDate"] < recent_cut]
-
-    ordered: List[Tuple[int, pd.Series]] = []
-    ordered.extend(list(df_recent.iterrows()))
-    ordered.extend(list(df_back.iterrows()))
-    return ordered
+    parts = slot.strip().split(":")
+    if len(parts) == 1:
+        h, m = int(parts[0]), 0
+    elif len(parts) == 2:
+        h, m = int(parts[0]), int(parts[1])
+    else:
+        raise ValueError(f"Formato de slot inválido '{slot}'. Usa 'HH' o 'HH:MM'.")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"Hora/minuto fuera de rango en slot '{slot}'")
+    return h, m
 
 
+# ---------------------------
+# Estructura de candidato
+# ---------------------------
+@dataclass
+class Candidate:
+    row_idx: int
+    platform: str
+    url_col: str
+    posted_col: str
+    last_posted_col: str
+    url: str
+    title: str
+    artist: Optional[str]
+    lang: Optional[str]
+    release_dt: Optional[datetime]
+    last_posted_at: Optional[datetime]
+    is_recent: bool
 
+
+# ---------------------------
+# BotScheduler
+# ---------------------------
 class BotScheduler:
-    def __init__(self):
-        self.tz = pytz.timezone(settings.TZ)
-        self.scheduler = BackgroundScheduler(timezone=self.tz)
-        self.db = DB()
-        self.excel = ExcelManager()
-        self.client = XClient()
+    def __init__(self) -> None:
+        self.scheduler = BackgroundScheduler(timezone=ZoneInfo(settings.TZ))
+        self.tz = ZoneInfo(settings.TZ)
+        self.jitter_seconds = int(getattr(settings, "SLOT_JITTER_MINUTES", 15)) * 60
 
-    def start(self):
-        # Slots horarios con jitter ±N minutos (convertido a segundos)
-        for i, hour in enumerate(settings.DAILY_SLOTS):
-            trig = CronTrigger(
-                hour=hour, minute=0,
-                jitter=settings.SLOT_JITTER_MINUTES * 60,
-                timezone=self.tz,
-            )
+        # Mapa columnas por plataforma
+        self.platform_cols: Dict[str, Dict[str, str]] = {
+            "YouTube":    {"url": "YouTubeURL",    "posted": "PostedYouTube",    "last": "LastPostedYouTubeAt"},
+            "Beatport":   {"url": "BeatportURL",   "posted": "PostedBeatport",   "last": "LastPostedBeatportAt"},
+            "AppleMusic": {"url": "AppleMusicURL", "posted": "PostedAppleMusic", "last": "LastPostedAppleMusicAt"},
+            "Spotify":    {"url": "SpotifyURL",    "posted": "PostedSpotify",    "last": "LastPostedSpotifyAt"},
+        }
+
+    # ---- Arranque del scheduler
+    def start(self) -> None:
+        # Programa un job por cada slot
+        for i, slot in enumerate(settings.DAILY_SLOTS):
+            h, m = _parse_slot_to_hm(slot)
+            trig = CronTrigger(hour=h, minute=m, timezone=self.tz)
             self.scheduler.add_job(
-                self.post_one, trigger=trig, kwargs={"slot_index": i}, id=f"slot-{i}"
+                self.run_once,
+                trigger=trig,
+                id=f"slot-{i}",
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=30 * 60,
+                jitter=self.jitter_seconds,  # retraso aleatorio 0..jitter
+            )
+            logger.info({"event": "slot_scheduled", "slot": slot, "id": f"slot-{i}", "jitter_sec": self.jitter_seconds})
+        self.scheduler.start()
+        logger.info({"event": "scheduler_started", "tz": str(self.tz)})
+
+    # ---- Lanza un post ahora (usado por el endpoint opcional)
+    def post_job_with_jitter(self, force_no_jitter: bool = True) -> None:
+        # Ejecutamos directo; el jitter ya se aplica sólo en cron.
+        self.run_once()
+
+    # ---- Job principal (una publicación)
+    def run_once(self) -> None:
+        now = datetime.now(self.tz)
+        try:
+            logger.info({"event": "job_start", "ts": now.isoformat()})
+            df = self._load_tracks_df()
+            if df is None or df.empty:
+                logger.warning({"event": "no_data"})
+                return
+
+            candidates = self._explode_candidates(df, now)
+            if not candidates:
+                logger.warning({"event": "no_candidates"})
+                return
+
+            cand = self._pick_candidate(candidates, now)
+            if not cand:
+                logger.warning({"event": "no_candidate_after_filters"})
+                return
+
+            # Generar copy
+            text = build_post(
+                title=cand.title,
+                artist=cand.artist,
+                lang=cand.lang,
+                release_dt=cand.release_dt,
+                platform=cand.platform,
+                url=cand.url,
             )
 
-        # Construye la cola cada día a las 00:05
-        self.scheduler.add_job(
-            self.build_daily_queue,
-            trigger=CronTrigger(hour=0, minute=5, timezone=self.tz),
-            id="plan-daily",
-        )
+            # Publicar
+            x = XClient()
+            media_ids = x.prepare_thumbnail_if_enabled(cand.url, cand.platform)
+            resp = x.post_text(text, media_ids=media_ids)
 
-        self.scheduler.start()
-        log(event="scheduler_started", slots=settings.DAILY_SLOTS, tz=settings.TZ)
+            logger.info({"event": "post_done", "platform": cand.platform, "url": cand.url, "dry_run": settings.DRY_RUN, "resp": resp})
 
-    def build_daily_queue(self):
-        today = date.today()
-        df = self.excel.load()
-        candidates = select_candidates(df, self.db)
-        if not candidates:
-            log(event="no_candidates_today")
-            return
+            # Persistencia (si NO es dry-run)
+            if not settings.DRY_RUN:
+                self._mark_posted(df, cand, now)
+                self._save_tracks_df(df)
 
-        chosen: List[Tuple[int, pd.Series]] = []
-        seen_urls = set()
-        for idx, row in candidates:
-            if len(chosen) >= settings.DAILY_POSTS:
-                break
-            url = row["YouTubeURL"]
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            chosen.append((idx, row))
+        except Exception as e:
+            logger.exception({"event": "job_exception", "error": str(e)})
+        finally:
+            logger.info({"event": "job_end", "ts": datetime.now(self.tz).isoformat()})
 
-        # Planifica en slots
-        for slot_index, (_, row) in enumerate(chosen[: settings.DAILY_POSTS]):
-            planned_at = self._localize_datetime(today, hour=settings.DAILY_SLOTS[slot_index])
-            self.db.upsert_queue_item(today, slot_index, row["YouTubeURL"], planned_at)
+    # ---------------------------
+    # Excel helpers
+    # ---------------------------
+    def _load_tracks_df(self) -> Optional[pd.DataFrame]:
+        try:
+            df = pd.read_excel(settings.EXCEL_PATH, sheet_name=getattr(settings, "EXCEL_SHEET", "Tracks"))
+        except FileNotFoundError:
+            logger.error({"event": "excel_not_found", "path": settings.EXCEL_PATH})
+            return None
+        except Exception as e:
+            logger.error({"event": "excel_read_error", "error": str(e)})
+            return None
 
-        log(event="daily_queue_built", count=len(chosen), date=str(today))
+        # Normaliza columnas básicas
+        base_cols = ["Title", "Artist", "Language", "ReleaseDate"]
+        for c in base_cols:
+            if c not in df.columns:
+                df[c] = None
 
-    def post_one(self, slot_index: int):
-        """
-        Publica 1 post (o simula si DRY_RUN=True).
-        - Intenta tomar de la cola diaria.
-        - Si no hay, selecciona al vuelo respetando reglas.
-        """
-        now = datetime.now(self.tz)
-        today = date.today()
+        # Fechas
+        if "ReleaseDate" in df.columns:
+            df["ReleaseDate"] = pd.to_datetime(df["ReleaseDate"], errors="coerce")
 
-        # 1) Intentar obtener URL de la cola
-        url_from_queue = self.db.claim_queue_item(today, slot_index)
-
-        # 2) Cargar Excel y localizar fila candidata
-        df = self.excel.load()
-
-        row = None
-        if url_from_queue:
-            matches = df[df["YouTubeURL"] == url_from_queue]
-            if not matches.empty:
-                _, row = next(iter(matches.iterrows()))
+        # Flags por plataforma
+        for plat, cols in self.platform_cols.items():
+            if cols["url"] not in df.columns:
+                df[cols["url"]] = None
+            if cols["posted"] not in df.columns:
+                df[cols["posted"]] = False
+            if cols["last"] not in df.columns:
+                df[cols["last"]] = pd.NaT
             else:
-                log(event="queue_url_missing_in_excel", url=url_from_queue)
+                df[cols["last"]] = pd.to_datetime(df[cols["last"]], errors="coerce")
 
-        if row is None:
-            # Selección al vuelo
-            candidates = select_candidates(df, self.db)
-            if not candidates:
-                log(event="skip_no_candidates", slot_index=slot_index)
-                self.db.finish_queue_item(today, slot_index, "skipped")
-                return
-            # Elige aleatorio entre los primeros 20 (para variar)
-            pick_idx, row = random.choice(candidates[: min(20, len(candidates))])
+        return df
 
-        # 3) Generar post neutral con mods
-        post = build_post(row)
-        text = post["text"]
-        base_url = post["youtube_url"]
+    def _save_tracks_df(self, df: pd.DataFrame) -> None:
+        path = settings.EXCEL_PATH
+        sheet = getattr(settings, "EXCEL_SHEET", "Tracks")
 
-        # 4) Enviar (o simular) a X
-        res = self.client.post_text(text)
+        try:
+            wb = load_workbook(path)
+            if sheet in wb.sheetnames:
+                # Elimina la hoja para reemplazarla
+                ws = wb[sheet]
+                wb.remove(ws)
+            # Escribe preservando otras hojas
+            with pd.ExcelWriter(path, engine="openpyxl", mode="a") as writer:
+                writer.book = wb
+                writer.sheets = {ws.title: ws for ws in wb.worksheets}
+                df.to_excel(writer, sheet_name=sheet, index=False)
+                writer.save()
+            logger.info({"event": "excel_saved", "path": path, "sheet": sheet})
+        except FileNotFoundError:
+            # Si no existía, crea el archivo
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name=sheet, index=False)
+            logger.info({"event": "excel_created", "path": path, "sheet": sheet})
+        except Exception as e:
+            logger.error({"event": "excel_write_error", "error": str(e)})
 
-        # 5) Persistir resultados
-        if settings.DRY_RUN:
-            # En simulación no marcamos historial ni Excel
-            self.db.finish_queue_item(today, slot_index, "dry_run")
-            log(event="posted_dry_run", slot_index=slot_index, response=res)
-        else:
-            # Guardar historial anti-duplicados y marcar Excel
-            self.db.add_history(base_url, now)
-            self._mark_excel_posted(base_url, now)
-            self.db.finish_queue_item(today, slot_index, "posted")
-            log(event="posted", slot_index=slot_index, response=res)
+    # ---------------------------
+    # Selección de candidato
+    # ---------------------------
+    def _explode_candidates(self, df: pd.DataFrame, now: datetime) -> List[Candidate]:
+        plats = settings.platforms  # lista desde PLATFORMS_ENABLED
+        out: List[Candidate] = []
+        recent_cut = now - timedelta(days=int(getattr(settings, "RECENT_DAYS_PRIORITY", 60)))
 
-    # ----------------- Helpers -----------------
+        for row_idx, row in df.iterrows():
+            title = str(row.get("Title") or "").strip()
+            artist = (str(row.get("Artist")) if pd.notna(row.get("Artist")) else None)
+            lang = (str(row.get("Language")) if pd.notna(row.get("Language")) else None)
+            rdt = row.get("ReleaseDate")
+            rdt_dt: Optional[datetime] = pd.to_datetime(rdt, errors="coerce").to_pydatetime() if pd.notna(rdt) else None
 
-    def _localize_datetime(self, d: date, hour: int) -> datetime:
-        naive = datetime(d.year, d.month, d.day, hour, 0, 0)
-        return self.tz.localize(naive)
+            for plat in plats:
+                if plat not in self.platform_cols:
+                    continue
+                cols = self.platform_cols[plat]
+                url = row.get(cols["url"])
+                if pd.isna(url) or not str(url).strip():
+                    continue
 
-    def _mark_excel_posted(self, youtube_url: str, when: datetime):
-        # Marca la PRIMERA fila que coincida con la URL dada
-        self.excel.load()
-        assert self.excel.df is not None
-        for idx, row in self.excel.iter_valid_rows():
-            if row["YouTubeURL"] == youtube_url:
-                self.excel.mark_posted(idx, when)
-                break
+                last_at = row.get(cols["last"])
+                last_dt = pd.to_datetime(last_at, errors="coerce").to_pydatetime() if pd.notna(last_at) else None
+
+                cand = Candidate(
+                    row_idx=row_idx,
+                    platform=plat,
+                    url_col=cols["url"],
+                    posted_col=cols["posted"],
+                    last_posted_col=cols["last"],
+                    url=str(url).strip(),
+                    title=title,
+                    artist=artist,
+                    lang=lang,
+                    release_dt=rdt_dt,
+                    last_posted_at=last_dt,
+                    is_recent=(rdt_dt is not None and rdt_dt >= recent_cut),
+                )
+
+                # Filtro de cooldown por URL (no repetir el MISMO URL en <= COOLDOWN días)
+                if self._is_url_in_cooldown(df, cand.url, plat, now):
+                    continue
+
+                out.append(cand)
+
+        return out
+
+    def _is_url_in_cooldown(self, df: pd.DataFrame, url: str, platform: str, now: datetime) -> bool:
+        cols = self.platform_cols[platform]
+        cooldown_days = int(getattr(settings, "COOLDOWN_DAYS_PER_URL", 30))
+        cutoff = now - timedelta(days=cooldown_days)
+
+        # Busca en TODAS las filas donde el URL de esa plataforma coincida
+        mask = (df[cols["url"]].astype(str).str.strip() == url.strip())
+        if mask.any():
+            last_col = cols["last"]
+            # Si existe algún last_posted >= cutoff, bloquea
+            recent = pd.to_datetime(df.loc[mask, last_col], errors="coerce")
+            if recent.notna().any() and (recent >= cutoff).any():
+                return True
+        return False
+
+    def _pick_candidate(self, candidates: List[Candidate], now: datetime) -> Optional[Candidate]:
+        if not candidates:
+            return None
+
+        # Orden: recientes primero, luego por fecha de lanzamiento (desc), y como desempate, índice original
+        def sort_key(c: Candidate):
+            # Para None en release_dt, poner muy antiguo
+            rd = c.release_dt or datetime(1970, 1, 1, tzinfo=self.tz)
+            return (0 if c.is_recent else 1, -rd.timestamp(), c.row_idx)
+
+        candidates.sort(key=sort_key)
+        return candidates[0]
+
+    # ---------------------------
+    # Persistencia tras publicar
+    # ---------------------------
+    def _mark_posted(self, df: pd.DataFrame, cand: Candidate, when: datetime) -> None:
+        df.loc[cand.row_idx, cand.posted_col] = True
+        df.loc[cand.row_idx, cand.last_posted_col] = when
+
+
+# Sugerencia: si tu main.py necesita una instancia global para endpoints, puedes crearla así:
+# scheduler_instance = BotScheduler()
