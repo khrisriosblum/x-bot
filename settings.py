@@ -1,9 +1,9 @@
 # settings.py
 from __future__ import annotations
 
-import os
 from pydantic import BaseSettings, Field
 from typing import List
+
 
 class Settings(BaseSettings):
     # ---------------------------
@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     # ---------------------------
     TZ: str = Field(default="Europe/Madrid")
     START_SCHEDULER: bool = Field(default=True)
-    SLOTS_LOCAL: str = Field(default="10:00,13:00,16:00,19:00,22:00")
-    SLOT_JITTER_MINUTES: int = Field(default=15)
+    SLOTS_LOCAL: str = Field(default="10:00,13:00,16:00,19:00,22:00")  # CSV de horas HH:MM
+    SLOT_JITTER_MINUTES: int = Field(default=15)  # +/- minutos
     CARD_WARMUP_SECONDS: int = Field(default=0)
 
     # ---------------------------
@@ -33,17 +33,17 @@ class Settings(BaseSettings):
     # ---------------------------
     # X API / Auth
     # ---------------------------
-    X_AUTH_METHOD: str = Field(default="oauth2")  # oauth1 | oauth2
-    X_BEARER_TOKEN: str = Field(default="")
-    X_API_KEY: str = Field(default="")
-    X_API_SECRET: str = Field(default="")
-    X_ACCESS_TOKEN: str = Field(default="")
-    X_ACCESS_SECRET: str = Field(default="")
+    X_AUTH_METHOD: str = Field(default="oauth2")  # "oauth1" | "oauth2"
+    X_BEARER_TOKEN: str = Field(default="")       # si oauth2
+    X_API_KEY: str = Field(default="")            # si oauth1
+    X_API_SECRET: str = Field(default="")         # si oauth1
+    X_ACCESS_TOKEN: str = Field(default="")       # si oauth1
+    X_ACCESS_SECRET: str = Field(default="")      # si oauth1
 
     # ---------------------------
     # Publicación
     # ---------------------------
-    PREVIEW_WAIT_SECONDS: int = Field(default=15)   # espera PRE-publicación (tras pegar el enlace)
+    PREVIEW_WAIT_SECONDS: int = Field(default=15)  # espera PRE-publicación (tras pegar el enlace)
     DRY_RUN: bool = Field(default=False)
 
     # ---------------------------
@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     # ---------------------------
     EXCEL_PATH: str = Field(default="./data/tracks.xlsx")
     EXCEL_SHEET: str = Field(default="Tracks")
+
     # ---------------------------
     # Miniatura opcional YouTube
     # ---------------------------
@@ -61,10 +62,19 @@ class Settings(BaseSettings):
         env_file = ".env"
         case_sensitive = False
 
+    # ---------------------------
     # Helpers convenientes
+    # ---------------------------
     @property
     def platforms(self) -> List[str]:
+        """Lista de plataformas activas a partir del CSV PLATFORMS_ENABLED."""
         return [s.strip() for s in self.PLATFORMS_ENABLED.split(",") if s.strip()]
+
+    @property
+    def DAILY_SLOTS(self) -> List[str]:
+        """Convierte SLOTS_LOCAL (CSV) en lista de horas HH:MM."""
+        return [s.strip() for s in self.SLOTS_LOCAL.split(",") if s.strip()]
+
 
 # instancia global
 settings = Settings()
