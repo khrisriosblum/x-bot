@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  x-bot:
+    build: .
+    container_name: x_bot
+    env_file: .env.xbot
+    volumes:
+      - ./data/chris.xlsx:/app/data/tracks.xlsx
+    restart: always
+
+  blum-bot:
+    build: .
+    container_name: blum_bot
+    env_file: .env.blumbot
+    volumes:
+      - ./data/blum.xlsx:/app/data/tracks.xlsx
+    restart: always
