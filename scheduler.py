@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,7 +22,7 @@ logger = logging.getLogger("xbot")
 # ---------------------------
 # Helpers horario
 # ---------------------------
-def _parse_slot_to_hm(slot: str) -> tuple[int, int]:
+def _parse_slot_to_hm(slot: str) -> Tuple[int, int]:
     """
     Acepta 'HH' o 'HH:MM' y devuelve (hora, minuto).
     Lanza ValueError si es inválido.
@@ -75,6 +75,10 @@ class BotScheduler:
             "Spotify":    {"url": "SpotifyURL",    "posted": "PostedSpotify",    "last": "LastPostedSpotifyAt"},
         }
 
+        # Cache por día para no repetir el MISMO URL en los 5 slots (sirve incluso en dry-run)
+        self._today_cache_date: Optional[str] = None  # "YYYY-MM-DD" en TZ del bot
+        self._today_cache_by_platform: Dict[str, set] = {p: set() for p in self.platform_cols.keys()}
+
     # ---- Arranque del scheduler
     def start(self) -> None:
         # Programa un job por cada slot
@@ -103,6 +107,7 @@ class BotScheduler:
     def run_once(self) -> None:
         now = datetime.now(self.tz)
         try:
+            self._ensure_today_cache(now)
             logger.info({"event": "job_start", "ts": now.isoformat()})
             df = self._load_tracks_df()
             if df is None or df.empty:
@@ -146,6 +151,9 @@ class BotScheduler:
             if not settings.DRY_RUN:
                 self._mark_posted(df, cand, now)
                 self._save_tracks_df(df)
+
+            # Evita que este URL se vuelva a elegir hoy en siguientes slots
+            self._today_cache_by_platform.get(cand.platform, set()).add(cand.url.strip())
 
         except Exception as e:
             logger.exception({"event": "job_exception", "error": str(e)})
@@ -192,6 +200,7 @@ class BotScheduler:
                 df[cols["last"]] = pd.NaT
             else:
                 last = pd.to_datetime(df[cols["last"]], errors="coerce")
+                # Guardamos naive en Excel, así que aquí lo dejamos naive
                 df[cols["last"]] = last
 
         return df
@@ -236,14 +245,12 @@ class BotScheduler:
 
             rdt_ts = pd.to_datetime(row.get("ReleaseDate"), errors="coerce")
             if pd.notna(rdt_ts):
-                # Asegura tz-aware en la TZ del bot
                 try:
                     if rdt_ts.tz is None:
                         rdt_ts = rdt_ts.tz_localize(self.tz)
                     else:
                         rdt_ts = rdt_ts.tz_convert(self.tz)
                 except AttributeError:
-                    # por si fuera datetime nativo
                     if rdt_ts.tzinfo is None:
                         rdt_ts = rdt_ts.replace(tzinfo=self.tz)
                 rdt_dt: Optional[datetime] = rdt_ts.to_pydatetime()
@@ -279,26 +286,50 @@ class BotScheduler:
                     is_recent=is_recent,
                 )
 
-                # Filtro de cooldown por URL (no repetir el MISMO URL en <= COOLDOWN días)
+                # Filtro de cooldown por URL (no repetir el MISMO URL dentro de la ventana)
                 if self._is_url_in_cooldown(df, cand.url, plat, now):
                     continue
 
                 out.append(cand)
 
-        return out
+        if not out:
+            return out
+
+        # --- Deduplicar por URL dentro de cada plataforma, quedándonos con el más reciente por ReleaseDate ---
+        deduped: List[Candidate] = []
+        seen_per_plat: Dict[str, set] = {p: set() for p in self.platform_cols.keys()}
+        out.sort(key=lambda c: (c.release_dt or datetime(1970, 1, 1, tzinfo=self.tz)), reverse=True)
+        for c in out:
+            seen = seen_per_plat[c.platform]
+            if c.url in seen:
+                continue
+            seen.add(c.url)
+            deduped.append(c)
+
+        return deduped
 
     def _is_url_in_cooldown(self, df: pd.DataFrame, url: str, platform: str, now: datetime) -> bool:
         cols = self.platform_cols[platform]
         cooldown_days = int(getattr(settings, "COOLDOWN_DAYS_PER_URL", 30))
-        cutoff = now - timedelta(days=cooldown_days)
 
-        # Busca en TODAS las filas donde el URL de esa plataforma coincida
+        # 1) Bloqueo in-memory del día (antes de tocar Excel)
+        self._ensure_today_cache(now)
+        if url.strip() in self._today_cache_by_platform.get(platform, set()):
+            return True
+
+        # 2) Bloqueo por Excel: compara con naive porque Excel se guarda naive
+        now_local_naive = now.astimezone(self.tz).replace(tzinfo=None)
+        cutoff_naive = now_local_naive - timedelta(days=cooldown_days)
+
         mask = (df[cols["url"]].astype(str).str.strip() == url.strip())
-        if mask.any():
-            last_col = cols["last"]
-            recent = pd.to_datetime(df.loc[mask, last_col], errors="coerce")
-            if recent.notna().any() and (recent >= cutoff).any():
-                return True
+        if not mask.any():
+            return False
+
+        last_col = cols["last"]
+        recent = pd.to_datetime(df.loc[mask, last_col], errors="coerce")  # -> naive
+        if recent.notna().any() and (recent >= cutoff_naive).any():
+            return True
+
         return False
 
     def _pick_candidate(self, candidates: List[Candidate], now: datetime) -> Optional[Candidate]:
@@ -307,7 +338,6 @@ class BotScheduler:
 
         # Orden: recientes primero, luego por fecha de lanzamiento (desc), y como desempate, índice original
         def sort_key(c: Candidate):
-            # Para None en release_dt, poner muy antiguo (con tz del bot)
             rd = c.release_dt or datetime(1970, 1, 1, tzinfo=self.tz)
             return (0 if c.is_recent else 1, -rd.timestamp(), c.row_idx)
 
@@ -323,7 +353,18 @@ class BotScheduler:
         when_naive = when.replace(tzinfo=None)
         df.loc[cand.row_idx, cand.last_posted_col] = when_naive
 
+    # ---------------------------
+    # Cache helpers
+    # ---------------------------
+    def _today_key(self, now: datetime) -> str:
+        return now.astimezone(self.tz).date().isoformat()
+
+    def _ensure_today_cache(self, now: datetime) -> None:
+        today_key = self._today_key(now)
+        if self._today_cache_date != today_key:
+            self._today_cache_date = today_key
+            self._today_cache_by_platform = {p: set() for p in self.platform_cols.keys()}
+
 
 # Sugerencia: si tu main.py necesita una instancia global para endpoints, puedes crearla así:
 # scheduler_instance = BotScheduler()
-
